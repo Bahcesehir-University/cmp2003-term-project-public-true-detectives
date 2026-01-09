@@ -1,194 +1,176 @@
 #include "analyzer.h"
-
 #include <fstream>
-#include <unordered_map>
 #include <algorithm>
-#include <cstdint>
+#include <cstring>
 
-// -------- Fast hour extraction --------
-// Works for "YYYY-MM-DD HH:MM" and "YYYY-MM-DD HH:MM:SS"
-static inline bool extractHourFast(const std::string& dt, int& hour) {
-    size_t sp = dt.find(' ');
-    if (sp == std::string::npos || sp + 2 >= dt.size()) return false;
-
-    char a = dt[sp + 1];
-    char b = dt[sp + 2];
-    if (a < '0' || a > '9' || b < '0' || b > '9') return false;
-
-    hour = (a - '0') * 10 + (b - '0');
-    return (0 <= hour && hour <= 23);
+inline bool TripAnalyzer::fastExtractHour(const char* datetime, size_t len, int& hour) const {
+    // find space between date and time
+    const char* space = nullptr;
+    for (size_t i = 0; i < len && i < 20; ++i) {
+        if (datetime[i] == ' ') {
+            space = datetime + i;
+            break;
+        }
+    }
+    
+    if (!space || space + 2 >= datetime + len) return false;
+    
+    char h1 = space[1];
+    char h2 = space[2];
+    
+    if ((h1 - '0') > 9u || (h2 - '0') > 9u) return false;
+    
+    hour = (h1 - '0') * 10 + (h2 - '0');
+    return hour <= 23;
 }
 
-static bool parseLineFast(const std::string& line, std::string& pickupZoneId, int& hour) {
-    size_t c1 = line.find(',');
-    if (c1 == std::string::npos) return false;
-
-    size_t c2 = line.find(',', c1 + 1);
-    if (c2 == std::string::npos) return false;
-
-    size_t c3 = line.find(',', c2 + 1);
-    if (c3 == std::string::npos) return false;
-
-    size_t c4 = line.find(',', c3 + 1);
-    if (c4 == std::string::npos) return false;
-
-    size_t c5 = line.find(',', c4 + 1);
-    if (c5 == std::string::npos) return false;
-
-    // Exactly 6 columns => no more commas after the 5th comma
-    if (line.find(',', c5 + 1) != std::string::npos) return false;
-
-    // PickupZoneID = between c1 and c2
-    if (c2 <= c1 + 1) return false;
-    pickupZoneId.assign(line, c1 + 1, c2 - (c1 + 1));
-    if (pickupZoneId.empty()) return false;
-
-    // PickupDateTime = between c3 and c4
-    if (c4 <= c3 + 1) return false;
-    std::string datetime(line, c3 + 1, c4 - (c3 + 1));
-
-    return extractHourFast(datetime, hour);
+// parse csv without creating unnecessary string copies
+static inline bool fastParseLine(const char* line, size_t lineLen, 
+                                  const char*& zoneStart, size_t& zoneLen,
+                                  const char*& dateStart, size_t& dateLen) {
+    const char* pos = line;
+    const char* end = line + lineLen;
+    int commaCount = 0;
+    const char* comma1 = nullptr;
+    const char* comma2 = nullptr;
+    const char* comma3 = nullptr;
+    
+    while (pos < end && commaCount < 4) {
+        if (*pos == ',') {
+            ++commaCount;
+            if (commaCount == 1) comma1 = pos;
+            else if (commaCount == 2) comma2 = pos;
+            else if (commaCount == 3) comma3 = pos;
+        }
+        ++pos;
+    }
+    
+    if (commaCount < 4 || !comma1 || !comma2 || !comma3) return false;
+    
+    // zone is between 1st and 2nd comma
+    zoneStart = comma1 + 1;
+    zoneLen = comma2 - zoneStart;
+    
+    // datetime is between 3rd comma and 4th
+    dateStart = comma3 + 1;
+    const char* comma4 = pos;
+    while (comma4 < end && *comma4 != ',') ++comma4;
+    dateLen = comma4 - dateStart;
+    
+    return zoneLen > 0 && dateLen > 0;
 }
-
-// -------- Internal state (kept in .cpp so analyzer.h stays unchanged) --------
-namespace {
-
-struct State {
-    // Store each zone string once, map it to a compact integer id
-    std::unordered_map<std::string, int> zoneToId;
-    std::vector<std::string> idToZone;
-
-    // Fast counters by zone id
-    std::vector<long long> zoneCount;
-
-    // key = (zoneId << 6) | hour   (hour fits in 6 bits)
-    std::unordered_map<std::uint64_t, long long> slotCount;
-};
-
-// One State per TripAnalyzer instance
-static std::unordered_map<const TripAnalyzer*, State> g_state;
-
-static inline std::uint64_t makeSlotKey(int zoneId, int hour) {
-    return ( (std::uint64_t)zoneId << 6 ) | (std::uint64_t)hour;
-}
-
-static int getZoneId(State& st, const std::string& zone) {
-    auto it = st.zoneToId.find(zone);
-    if (it != st.zoneToId.end()) return it->second;
-
-    int id = (int)st.idToZone.size();
-    st.idToZone.push_back(zone);
-    st.zoneToId.emplace(zone, id);
-    st.zoneCount.push_back(0);
-    return id;
-}
-
-} // namespace
 
 void TripAnalyzer::ingestFile(const std::string& csvPath) {
-    State& st = g_state[this];
-
-    // Reset counts every ingest (tests can call ingest once per instance)
-    st.zoneToId.clear();
-    st.idToZone.clear();
-    st.zoneCount.clear();
-    st.slotCount.clear();
-
-    std::ifstream fin(csvPath);
-    if (!fin.is_open()) {
-        // A1 expects no crash and empty results
-        return;
-    }
-
-    // Light reserves help performance on big inputs (safe defaults)
-    st.zoneToId.reserve(65536);
-    st.slotCount.reserve(65536);
-
+    std::ifstream file(csvPath);
+    
+    if (!file.is_open()) return;
+    
+    // pre-allocate to avoid rehashing
+    zoneCount_.reserve(1024);
+    slotCount_.reserve(8192);
+    zoneIndex_.reserve(1024);
+    zoneToIdx_.reserve(1024);
+    
     std::string line;
-
-    // Skip header (tests always write header first)
-    if (!std::getline(fin, line)) return;
-
-    // Process remaining lines
-    while (std::getline(fin, line)) {
-        std::string zone;
+    line.reserve(256);
+    
+    // skip header
+    if (!std::getline(file, line)) return;
+    
+    while (std::getline(file, line)) {
+        const char* linePtr = line.c_str();
+        size_t lineLen = line.size();
+        
+        const char* zoneStart;
+        size_t zoneLen;
+        const char* dateStart;
+        size_t dateLen;
+        
+        if (!fastParseLine(linePtr, lineLen, zoneStart, zoneLen, dateStart, dateLen)) {
+            continue;
+        }
+        
         int hour;
-
-        // Skip dirty lines safely
-        if (!parseLineFast(line, zone, hour)) continue;
-
-        int zoneId = getZoneId(st, zone);
-
-        ++st.zoneCount[zoneId];
-        ++st.slotCount[makeSlotKey(zoneId, hour)];
+        if (!fastExtractHour(dateStart, dateLen, hour)) {
+            continue;
+        }
+        
+        std::string zone(zoneStart, zoneLen);
+        
+        ++zoneCount_[zone];
+        
+        // map zone to index for compact slot storage
+        auto it = zoneToIdx_.find(zone);
+        uint32_t zoneIdx;
+        if (it == zoneToIdx_.end()) {
+            zoneIdx = static_cast<uint32_t>(zoneIndex_.size());
+            zoneToIdx_[zone] = zoneIdx;
+            zoneIndex_.push_back(std::move(zone));
+        } else {
+            zoneIdx = it->second;
+        }
+        
+        SlotKey key = makeSlotKey(zoneIdx, static_cast<uint8_t>(hour));
+        ++slotCount_[key];
     }
 }
 
 std::vector<ZoneCount> TripAnalyzer::topZones(int k) const {
-    if (k <= 0) return {};
-
-    auto it = g_state.find(this);
-    if (it == g_state.end()) return {};
-
-    const State& st = it->second;
-
-    std::vector<ZoneCount> out;
-    out.reserve(st.idToZone.size());
-
-    for (int id = 0; id < (int)st.idToZone.size(); ++id) {
-        long long cnt = st.zoneCount[id];
-        if (cnt == 0) continue;
-        out.push_back(ZoneCount{st.idToZone[id], cnt});
+    if (zoneCount_.empty()) return {};
+    
+    std::vector<ZoneCount> v;
+    v.reserve(zoneCount_.size());
+    
+    for (const auto& kv : zoneCount_) {
+        v.push_back(ZoneCount{kv.first, kv.second});
     }
-
-    // count desc, zone asc
+    
     auto cmp = [](const ZoneCount& a, const ZoneCount& b) {
-        if (a.count != b.count) return a.count > b.count;
-        return a.zone < b.zone;
+        return a.count != b.count ? a.count > b.count : a.zone < b.zone;
     };
-
-    if ((int)out.size() > k) {
-        std::nth_element(out.begin(), out.begin() + k, out.end(), cmp);
-        out.resize(k);
+    
+    size_t n = v.size();
+    size_t topK = static_cast<size_t>(k);
+    
+    // partial sort: faster than full sort when k << n
+    if (n > topK) {
+        std::nth_element(v.begin(), v.begin() + topK, v.end(), cmp);
+        v.resize(topK);
     }
-    std::sort(out.begin(), out.end(), cmp);
-
-    return out;
+    
+    std::sort(v.begin(), v.end(), cmp);
+    return v;
 }
 
 std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
-    if (k <= 0) return {};
-
-    auto it = g_state.find(this);
-    if (it == g_state.end()) return {};
-
-    const State& st = it->second;
-
-    std::vector<SlotCount> out;
-    out.reserve(st.slotCount.size());
-
-    for (const auto& kv : st.slotCount) {
-        std::uint64_t key = kv.first;
-        long long cnt = kv.second;
-
-        int hour = (int)(key & 63ULL);
-        int zoneId = (int)(key >> 6);
-
-        out.push_back(SlotCount{st.idToZone[zoneId], hour, cnt});
+    if (slotCount_.empty()) return {};
+    
+    std::vector<SlotCount> v;
+    v.reserve(slotCount_.size());
+    
+    for (const auto& kv : slotCount_) {
+        uint32_t zoneIdx = getZoneIdx(kv.first);
+        uint8_t hour = getHour(kv.first);
+        
+        if (zoneIdx >= zoneIndex_.size()) continue;
+        
+        v.push_back(SlotCount{zoneIndex_[zoneIdx], static_cast<int>(hour), kv.second});
     }
-
-    // count desc, zone asc, hour asc
+    
     auto cmp = [](const SlotCount& a, const SlotCount& b) {
         if (a.count != b.count) return a.count > b.count;
-        if (a.zone != b.zone)   return a.zone < b.zone;
+        if (a.zone != b.zone) return a.zone < b.zone;
         return a.hour < b.hour;
     };
-
-    if ((int)out.size() > k) {
-        std::nth_element(out.begin(), out.begin() + k, out.end(), cmp);
-        out.resize(k);
+    
+    size_t n = v.size();
+    size_t topK = static_cast<size_t>(k);
+    
+    if (n > topK) {
+        std::nth_element(v.begin(), v.begin() + topK, v.end(), cmp);
+        v.resize(topK);
     }
-    std::sort(out.begin(), out.end(), cmp);
-
-    return out;
+    
+    std::sort(v.begin(), v.end(), cmp);
+    return v;
 }
