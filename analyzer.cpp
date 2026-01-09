@@ -1,12 +1,11 @@
 #include "analyzer.h"
 #include <fstream>
 #include <algorithm>
-#include <cstring>
+#include <sstream>
 
 inline bool TripAnalyzer::fastExtractHour(const char* datetime, size_t len, int& hour) const {
-    // find space between date and time
     const char* space = nullptr;
-    for (size_t i = 0; i < len && i < 20; ++i) {
+    for (size_t i = 0; i < len && i < 30; ++i) {
         if (datetime[i] == ' ') {
             space = datetime + i;
             break;
@@ -18,94 +17,62 @@ inline bool TripAnalyzer::fastExtractHour(const char* datetime, size_t len, int&
     char h1 = space[1];
     char h2 = space[2];
     
-    if ((h1 - '0') > 9u || (h2 - '0') > 9u) return false;
+    if (h1 < '0' || h1 > '9' || h2 < '0' || h2 > '9') return false;
     
     hour = (h1 - '0') * 10 + (h2 - '0');
-    return hour <= 23;
-}
-
-// parse csv without creating unnecessary string copies
-static inline bool fastParseLine(const char* line, size_t lineLen, 
-                                  const char*& zoneStart, size_t& zoneLen,
-                                  const char*& dateStart, size_t& dateLen) {
-    const char* pos = line;
-    const char* end = line + lineLen;
-    int commaCount = 0;
-    const char* comma1 = nullptr;
-    const char* comma2 = nullptr;
-    const char* comma3 = nullptr;
-    
-    while (pos < end && commaCount < 4) {
-        if (*pos == ',') {
-            ++commaCount;
-            if (commaCount == 1) comma1 = pos;
-            else if (commaCount == 2) comma2 = pos;
-            else if (commaCount == 3) comma3 = pos;
-        }
-        ++pos;
-    }
-    
-    if (commaCount < 4 || !comma1 || !comma2 || !comma3) return false;
-    
-    // zone is between 1st and 2nd comma
-    zoneStart = comma1 + 1;
-    zoneLen = comma2 - zoneStart;
-    
-    // datetime is between 3rd comma and 4th
-    dateStart = comma3 + 1;
-    const char* comma4 = pos;
-    while (comma4 < end && *comma4 != ',') ++comma4;
-    dateLen = comma4 - dateStart;
-    
-    return zoneLen > 0 && dateLen > 0;
+    return hour >= 0 && hour <= 23;
 }
 
 void TripAnalyzer::ingestFile(const std::string& csvPath) {
     std::ifstream file(csvPath);
     
-    if (!file.is_open()) return;
+    if (!file.is_open()) {
+        return;
+    }
     
-    // pre-allocate to avoid rehashing
     zoneCount_.reserve(1024);
     slotCount_.reserve(8192);
     zoneIndex_.reserve(1024);
     zoneToIdx_.reserve(1024);
     
     std::string line;
-    line.reserve(256);
     
-    // skip header
-    if (!std::getline(file, line)) return;
+    // skip header row
+    if (!std::getline(file, line)) {
+        return;
+    }
     
     while (std::getline(file, line)) {
-        const char* linePtr = line.c_str();
-        size_t lineLen = line.size();
+        if (line.empty()) continue;
         
-        const char* zoneStart;
-        size_t zoneLen;
-        const char* dateStart;
-        size_t dateLen;
+        std::vector<std::string> fields;
+        std::stringstream ss(line);
+        std::string field;
         
-        if (!fastParseLine(linePtr, lineLen, zoneStart, zoneLen, dateStart, dateLen)) {
-            continue;
+        while (std::getline(ss, field, ',')) {
+            fields.push_back(field);
         }
+        
+        if (fields.size() < 6) continue;
+        
+        std::string zone = fields[1];
+        std::string datetime = fields[3];
+        
+        if (zone.empty() || datetime.empty()) continue;
         
         int hour;
-        if (!fastExtractHour(dateStart, dateLen, hour)) {
+        if (!fastExtractHour(datetime.c_str(), datetime.size(), hour)) {
             continue;
         }
-        
-        std::string zone(zoneStart, zoneLen);
         
         ++zoneCount_[zone];
         
-        // map zone to index for compact slot storage
         auto it = zoneToIdx_.find(zone);
         uint32_t zoneIdx;
         if (it == zoneToIdx_.end()) {
             zoneIdx = static_cast<uint32_t>(zoneIndex_.size());
             zoneToIdx_[zone] = zoneIdx;
-            zoneIndex_.push_back(std::move(zone));
+            zoneIndex_.push_back(zone);
         } else {
             zoneIdx = it->second;
         }
@@ -116,37 +83,37 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
 }
 
 std::vector<ZoneCount> TripAnalyzer::topZones(int k) const {
-    if (zoneCount_.empty()) return {};
+    std::vector<ZoneCount> result;
     
-    std::vector<ZoneCount> v;
-    v.reserve(zoneCount_.size());
+    if (zoneCount_.empty()) return result;
+    
+    result.reserve(zoneCount_.size());
     
     for (const auto& kv : zoneCount_) {
-        v.push_back(ZoneCount{kv.first, kv.second});
+        result.push_back(ZoneCount{kv.first, kv.second});
     }
     
     auto cmp = [](const ZoneCount& a, const ZoneCount& b) {
-        return a.count != b.count ? a.count > b.count : a.zone < b.zone;
+        if (a.count != b.count) return a.count > b.count;
+        return a.zone < b.zone;
     };
     
-    size_t n = v.size();
-    size_t topK = static_cast<size_t>(k);
-    
-    // partial sort: faster than full sort when k << n
-    if (n > topK) {
-        std::nth_element(v.begin(), v.begin() + topK, v.end(), cmp);
-        v.resize(topK);
+    if (result.size() > static_cast<size_t>(k)) {
+        std::nth_element(result.begin(), result.begin() + k, result.end(), cmp);
+        result.resize(k);
     }
     
-    std::sort(v.begin(), v.end(), cmp);
-    return v;
+    std::sort(result.begin(), result.end(), cmp);
+    
+    return result;
 }
 
 std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
-    if (slotCount_.empty()) return {};
+    std::vector<SlotCount> result;
     
-    std::vector<SlotCount> v;
-    v.reserve(slotCount_.size());
+    if (slotCount_.empty()) return result;
+    
+    result.reserve(slotCount_.size());
     
     for (const auto& kv : slotCount_) {
         uint32_t zoneIdx = getZoneIdx(kv.first);
@@ -154,7 +121,7 @@ std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
         
         if (zoneIdx >= zoneIndex_.size()) continue;
         
-        v.push_back(SlotCount{zoneIndex_[zoneIdx], static_cast<int>(hour), kv.second});
+        result.push_back(SlotCount{zoneIndex_[zoneIdx], static_cast<int>(hour), kv.second});
     }
     
     auto cmp = [](const SlotCount& a, const SlotCount& b) {
@@ -163,14 +130,12 @@ std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
         return a.hour < b.hour;
     };
     
-    size_t n = v.size();
-    size_t topK = static_cast<size_t>(k);
-    
-    if (n > topK) {
-        std::nth_element(v.begin(), v.begin() + topK, v.end(), cmp);
-        v.resize(topK);
+    if (result.size() > static_cast<size_t>(k)) {
+        std::nth_element(result.begin(), result.begin() + k, result.end(), cmp);
+        result.resize(k);
     }
     
-    std::sort(v.begin(), v.end(), cmp);
-    return v;
+    std::sort(result.begin(), result.end(), cmp);
+    
+    return result;
 }
